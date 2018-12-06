@@ -1,0 +1,5 @@
+consulate==0.6.0
+influxdb==5.2.0
+redis==3.0.1
+requests==2.20.1
+pytz==2018.7

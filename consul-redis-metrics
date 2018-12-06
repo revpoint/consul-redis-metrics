@@ -1,0 +1,161 @@
+#!/usr/bin/env python
+import os
+import sys
+from collections import namedtuple
+from datetime import datetime
+from typing import List, Mapping
+
+import consulate
+import influxdb
+import pytz
+import redis
+
+
+CONSUL_HOST = os.environ.get('CONSUL_HOST', os.environ.get('HOST', 'localhost'))
+INFLUXDB_RETENTION = os.environ.get('INFLUXDB_RETENTION', '7d')
+
+
+ServerInfo = namedtuple('ServerInfo', 'address port id node')
+
+
+def get_service_instances(service_name: str) -> List[ServerInfo]:
+    consul = consulate.Consul(CONSUL_HOST)
+    service = consul.catalog.service(service_name)
+    return [ServerInfo(i['ServiceAddress'], i['ServicePort'], i['ServiceID'], i['Node']) for i in service]
+
+
+def collect_redis_stats(host: str, port: int, db: int=0):
+    r = redis.Redis(host, port=port, db=db)
+    info = r.info()
+    cmd_info = r.info('commandstats')
+
+    return dict(list(info.items()) + list(cmd_info.items()))
+
+
+command_groups = {
+    'GetTypeCmds': ['get', 'getbit', 'getrange', 'getset', 'mget', 'hget', 'hgetall', 'hmget'],
+    'SetTypeCmds': ['set', 'setbit', 'setex', 'setnx', 'setrange', 'mset', 'msetnx', 'psetnx',
+                    'hmset', 'hset', 'hsetnx', 'lset'],
+    'KeyBasedCmds': ['zdel', 'dump', 'exists', 'expire', 'expireat', 'keys', 'move', 'persist',
+                     'pexpire', 'pexpireat', 'pttl', 'rename', 'renamenx', 'restore', 'ttl',
+                     'type', 'append', 'bitcount', 'bitop', 'bitpos', 'decr', 'decrby', 'get',
+                     'getbit', 'getrange', 'getset', 'incr', 'incrby', 'incrbyfloat', 'mget',
+                     'mset', 'msetnx', 'psetnx', 'set', 'setbit', 'setex', 'setnx', 'setrange',
+                     'strlen', 'hdel', 'hexists', 'hget', 'hgetall', 'hincrby', 'hincrbyfloat',
+                     'hkeys', 'hlen', 'hmget', 'hmset', 'hset', 'hsetnx', 'hvals', 'blpop',
+                     'brpop', 'lindex', 'linsert', 'llen', 'lpop', 'lpush', 'lpushx', 'lrange',
+                     'lrem', 'lset', 'ltrim', 'rpop', 'rpush', 'rpushx', 'sadd', 'scard', 'sdiff',
+                     'sdiffstore', 'sinter', 'sinterstore', 'sismember', 'smembers', 'spop',
+                     'srandmember', 'srem', 'sunion', 'sunionstore', 'sscan', 'zadd', 'zcard',
+                     'zcount', 'zincrby', 'zinterstore', 'zlexcount', 'zrange', 'zrangebylex',
+                     'zrangebyscore', 'zrank', 'zrem', 'zremrangebylex', 'zremrangebyrank',
+                     'zremrangebyscore', 'zrevrange', 'zrevrangebyscore', 'zrevrank', 'zscore',
+                     'zunionstore', 'zscan', 'pfadd', 'pfcount', 'pfmerge', 'watch', 'eval',
+                     'evalsha'],
+    'StringBasedCmds': ['append', 'bitcount', 'bitop', 'bitpos', 'decr', 'decrby', 'get', 'getbit',
+                        'getrange', 'getset', 'incr', 'incrby', 'incrbyfloat', 'mget', 'mset',
+                        'msetnx', 'psetnx', 'set', 'setbit', 'setex', 'setnx', 'setrange', 'strlen'],
+    'HashBasedCmds': ['hdel', 'hexists', 'hget', 'hgetall', 'hincrby', 'hincrbyfloat', 'hkeys',
+                      'hlen', 'hmget', 'hmset', 'hset', 'hsetnx', 'hvals', 'hscan'],
+    'ListBasedCmds': ['blpop', 'brpop', 'brpoplpush', 'lindex', 'linsert', 'llen', 'lpop', 'lpush',
+                      'lpushx', 'lrange', 'lrem', 'lset', 'ltrim', 'rpop', 'rpoplpush', 'rpush',
+                      'rpushx'],
+    'SetBasedCmds': ['sadd', 'scard', 'sdiff', 'sdiffstore', 'sinter', 'sinterstore', 'sismember',
+                     'smembers', 'smove', 'spop', 'srandmember', 'srem', 'sunion', 'sunionstore',
+                     'sscan'],
+    'SortedSetBasedCmds': ['zadd', 'zcard', 'zcount', 'zincrby', 'zinterstore', 'zlexcount',
+                           'zrange', 'zrangebylex', 'zrangebyscore', 'zrank', 'zrem',
+                           'zremrangebylex', 'zremrangebyrank', 'zremrangebyscore', 'zrevrange',
+                           'zrevrangebyscore', 'zrevrank', 'zscore', 'zunionstore', 'zscan'],
+    'HyperLogLogBasedCmds': ['pfadd', 'pfcount', 'pfmerge'],
+    'ScriptBasedCmds': ['eval', 'evalsha']
+}
+
+
+def get_metrics_for_server(server_info: ServerInfo) -> Mapping[str, int]:
+    redis_data = collect_redis_stats(server_info.address, server_info.port)
+
+    metrics = {
+        'CurrConnections': redis_data['connected_clients'],
+        'Evictions': redis_data['evicted_keys'],
+        'Reclaimed': redis_data['expired_keys'],
+        'CacheHits': redis_data['keyspace_hits'],
+        'CacheMisses': redis_data['keyspace_misses'],
+        'UsedMemory': redis_data['used_memory'],
+        'IOPS': redis_data['instantaneous_ops_per_sec'],
+        'InputKbps': redis_data['instantaneous_input_kbps'],
+        'OutputKbps': redis_data['instantaneous_output_kbps'],
+        'CurrItems': 0,
+    }
+    for i in range(10):
+        db = f'db{i}'
+        if db in redis_data:
+            metrics['CurrItems'] += redis_data[db]['keys']
+
+    for command_group, commands in command_groups.items():
+        metrics[command_group] = 0
+        for command in commands:
+            key = 'cmdstat_' + command
+            if key in redis_data:
+                metrics[command_group] += redis_data[key]['calls']
+
+    return metrics
+
+
+def format_influx_data(service_name: str, server_info: ServerInfo, metrics: Mapping[str, int]) -> List[dict]:
+    points = []
+    timestamp = datetime.utcnow().replace(tzinfo=pytz.utc)
+    for key, value in metrics.items():
+        points.append({
+            'measurement': key,
+            'tags': {
+                'service': service_name,
+                'id': server_info.id,
+                'node': server_info.node,
+            },
+            'time': timestamp,
+            'fields': {'value': value}
+        })
+    return points
+
+
+def get_influx_client(influx_dsn: str) -> influxdb.InfluxDBClient:
+    client = influxdb.InfluxDBClient.from_dsn(influx_dsn)
+    db_name = client._database
+    if db_name:
+        existing_dbs = client.get_list_database()
+        for db in existing_dbs:
+            if db['name'] == db_name:
+                break
+        else:
+            client.create_database(db_name)
+            client.create_retention_policy(f'{db_name}_policy', INFLUXDB_RETENTION, 1, default=True)
+    return client
+
+
+def error(msg: str, code: int=1):
+    print(msg)
+    sys.exit(code)
+
+
+def main(influx_dsn, *service_names):
+    influx = get_influx_client(influx_dsn)
+
+    for service_name in service_names:
+        redis_servers = get_service_instances(service_name)
+        if not redis_servers:
+            print(f'No instances for consul service "{service_name}"')
+            continue
+
+        for server_info in redis_servers:
+            metrics = get_metrics_for_server(server_info)
+            print(f'Writing {len(metrics)} points for: {server_info.id}')
+            data = format_influx_data(service_name, server_info, metrics)
+            influx.write_points(data, time_precision='m')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        error(f'Usage: {sys.argv[0]} INFLUX_DSN SERVICE_NAME [SERVICE_NAME ...]')
+
+    main(*sys.argv[1:])
