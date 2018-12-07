@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import os
-import sys
 from collections import namedtuple
 from datetime import datetime
 from typing import List, Mapping
@@ -133,11 +132,6 @@ def get_influx_client(influx_dsn: str) -> influxdb.InfluxDBClient:
     return client
 
 
-def error(msg: str, code: int=1):
-    print(msg)
-    sys.exit(code)
-
-
 def main(influx_dsn, *service_names):
     influx = get_influx_client(influx_dsn)
 
@@ -155,7 +149,10 @@ def main(influx_dsn, *service_names):
 
 
 if __name__ == '__main__':
+    import sys
+
     if len(sys.argv) < 3:
-        error(f'Usage: {sys.argv[0]} INFLUX_DSN SERVICE_NAME [SERVICE_NAME ...]')
+        print(f'Usage: {sys.argv[0]} INFLUX_DSN SERVICE_NAME [SERVICE_NAME ...]')
+        sys.exit(1)
 
     main(*sys.argv[1:])
